@@ -143,10 +143,18 @@ class RollingHedonic(_baseOLS):
 
 class DynamicHedonic(_baseOLS):
     def __init__(
-        self, Ys, Xs, sites=None, MClarge=None, autoL=True, ev_ratio=0.25, L=25
+        self,
+        Ys,
+        Xs,
+        sites=None,
+        MClarge=None,
+        autoL=True,
+        ev_ratio=0.25,
+        L=25,
+        weights=None,
     ):
         super().__init__(Ys, Xs, sites, MClarge, autoL, ev_ratio, L)
-        self.setup()
+        self.setup(weights=weights)
 
     def setup(
         self,
@@ -155,6 +163,7 @@ class DynamicHedonic(_baseOLS):
         seasonal=None,
         deterministic=False,
         ev_systems={"randomwalk": True},
+        weights=None,
     ):
         endogs = self.Ys
         if self.sites is None:
@@ -220,6 +229,7 @@ class DynamicHedonic(_baseOLS):
             trend=self.trend,
             seasonal=self.seasonal,
             deterministic=self.deterministic,
+            weights=weights,
         )
         if self.sites is not None:
             p0 = np.diag(self.DLM.P0)
