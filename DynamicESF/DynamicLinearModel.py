@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 
 class DiagonalDLS:
-    def __init__(self, Y, A, C, gamma, sigma2, learn_gamma, mu0, P0):
+    def __init__(self, Y, A, C, gamma, sigma2, learn_gamma, mu0, P0, weights=None):
         """Dynamic Linear Model with Diagonal Covariances
 
         Parameters
@@ -25,6 +25,10 @@ class DiagonalDLS:
             mean of initial prior
         P0 : array-like, (Dx, Dx)
             covariance matrix of initial prior
+        weights: None or array-like (same shape with Y)
+            weights on observations. The observation covariance matrix is set to be sigma2 * diag(1/weights).
+            All elements must be positive
+            If None, all weights are set to be one
         """
 
         self.Y = np.array(Y, dtype=object)
@@ -45,13 +49,32 @@ class DiagonalDLS:
 
         self.mode_filter = "direct"
 
+        if weights is None:
+            self.weights = np.array(
+                [np.ones_like(self.Y[t], dtype=float) for t in range(self.T)],
+                dtype=object,
+            )
+        else:
+            try:
+                w = [weights[t].reshape(self.Y[t].shape) for t in range(self.T)]
+            except:
+                raise ValueError("weights must be the same shape to Y")
+
+            if not np.all([np.all(weights[t] > 0) for t in range(self.T)]):
+                raise ValueError("All weights must be positive")
+
+            self.weights = np.array(w, dtype=object)
+
     def EMalgorithm(
         self, maxiter, loss_record=False, Q_record=True, miniter=10, tol=1e-5
     ):
         if loss_record:
             self.loss = []
-        elif Q_record:
+        if Q_record:
             self.Q = []
+
+        if not (loss_record or Q_record):
+            print("loss or Q should be recorded.")
 
         params = np.concatenate(
             [np.diag(self.P0), self.gamma[self.learn_gamma], np.array([self.sigma2])]
@@ -64,13 +87,14 @@ class DiagonalDLS:
                 self.Mstep()
                 if loss_record:
                     self.loss.append(-np.sum(self.loglik))
-                    pbar.set_description(desc="loss={:.3f}".format(self.loss[i]))
-                    if i > 1:
-                        self.soc2.append(
-                            np.abs(self.loss[-2] - self.loss[-1])
-                            / (1 + np.abs(self.loss[-1]))
-                        )
-                elif Q_record:
+                    if not Q_record:
+                        pbar.set_description(desc="loss={:.3f}".format(self.loss[i]))
+                        if i > 1:
+                            self.soc2.append(
+                                np.abs(-self.loss[-2] + self.loss[-1])
+                                / (1 + np.abs(self.loss[-1]))
+                            )
+                if Q_record:
                     self.Q.append(self._calc_Q())
                     pbar.set_description(desc="Q={:.3f}".format(self.Q[i]))
                     if i > 1:
@@ -122,14 +146,13 @@ class DiagonalDLS:
         self.P = np.empty((self.T, self.Dx, self.Dx), dtype=float)
 
         Gamma = np.diag(self.gamma)
+        Sigma = [np.diag(self.sigma2 / w.flatten().astype(float)) for w in self.weights]
         if self.mode_filter == "direct":
             filtering = self.filtering_direct
             eval_lik = self.eval_lik_direct
-            Sigma = [self.sigma2] * self.T
         else:
             filtering = self.filtering
             eval_lik = self.eval_lik
-            Sigma = [self.sigma2 * np.eye(d) for d in self.Dy]
 
         t = 0
         self.P[t - 1] = self.P0
@@ -208,27 +231,39 @@ class DiagonalDLS:
         #         Sigmainv = np.diag(1/np.diag(Sigma)) # Sigma is assumed to be diagonal
         #         V_filter = self._inv(Pinv + C.T @ Sigmainv @ C)
         #         mu_filter = V_filter @ (C.T @ Sigmainv @ y + Pinv @ pred_mean)
-        sigmainv = (
-            1 / Sigma
-        )  # Sigma is assumed to be diagonal and all elements are same
-        V_filter = self._inv(Pinv + sigmainv * C.T @ C)
-        mu_filter = V_filter @ (sigmainv * C.T @ y + Pinv @ pred_mean)
+        sigmainv = 1 / np.diag(Sigma)  # Sigma is assumed to be diagonal
+        CtSigmainv = (sigmainv.reshape(-1, 1) * C).T
+        V_filter = self._inv(Pinv + CtSigmainv @ C)
+        mu_filter = V_filter @ (CtSigmainv @ y + Pinv @ pred_mean)
         return mu_filter, V_filter
 
     def eval_lik_direct(self, y, pred_mean, P, C, Sigma):
         Pinv = self._inv(P)
-        # Sigmainv = np.diag(1/np.diag(Sigma)) # Sigma is assumed to be diagonal
-        # prec = Sigmainv - Sigmainv @ C @ self._inv(
-        #   Pinv + C.T @ Sigmainv @ C
-        # ) @ C.T @ Sigmainv # Woodbury identity
-        sigmainv = (
-            1 / Sigma
-        )  # Sigma is assumed to be diagonal and all elements are same
+
+        sigmainv = 1 / np.diag(Sigma)  # Sigma is assumed to be diagonal
+        CtSigmainv = (sigmainv.reshape(-1, 1) * C).T
         prec = (
-            sigmainv * np.eye(len(y))
-            - sigmainv * C @ self._inv(Pinv + sigmainv * C.T @ C) @ C.T * sigmainv
+            np.diag(sigmainv)
+            - CtSigmainv.T @ self._inv(Pinv + CtSigmainv @ C) @ CtSigmainv
         )  # Woodbury identity
-        return self._logpdf_mvgauss(obs=y, mean=C @ pred_mean, cov=None, prec=prec)
+
+        # Sigmainv = np.diag(1 / np.diag(Sigma))  # Sigma is assumed to be diagonal
+        # prec = (
+        #     Sigmainv
+        #     - Sigmainv @ C @ self._inv(Pinv + C.T @ Sigmainv @ C) @ C.T @ Sigmainv
+        # )  # Woodbury identity
+
+        # sigmainv = (
+        #     1 / Sigma
+        # )  # Sigma is assumed to be diagonal and all elements are same
+        # prec = (
+        #     sigmainv * np.eye(len(y))
+        #     - sigmainv * C @ self._inv(Pinv + sigmainv * C.T @ C) @ C.T * sigmainv
+        # )  # Woodbury identity
+
+        return self._logpdf_mvgauss(
+            obs=y, mean=C @ pred_mean, cov=None, prec=prec.astype(float)
+        )
 
     def smoothing(self, mu, V, mu_, V_, A, P):
         J = V @ A.T @ self._inv(P)
@@ -265,7 +300,10 @@ class DiagonalDLS:
             xxT = self._xxT[t]
             # sigma2T += np.trace(y @ y.T - c @ x @ y.T - y @ x.T @ c.T + c @ xxT @ c.T)
             y_hat = c @ x
-            sigma2T += np.trace(y.T @ (y - 2 * y_hat)) + np.trace(xxT @ c.T @ c)
+            w = self.weights[t].astype(float)
+            Wy = w * y
+            WC = w * c
+            sigma2T += np.trace(Wy.T @ (y - 2 * y_hat)) + np.trace(xxT @ c.T @ WC)
         self.sigma2 = sigma2T / np.sum(self.Dy)
 
     def _calc_Q(self):
@@ -310,35 +348,24 @@ class DiagonalDLS:
             )
         )
 
-        # for t in range(1, self.T):
-        #     Q -= 0.5 * (
-        #         self.Dx * np.log(2 * np.pi)
-        #         + self._logdetdiag(self.gamma)
-        #         + np.trace(self._xxT[t] @ Gammainv)
-        #         - np.trace(self._xx_1T[t - 1].T @ Gammainv @ self.A[t])
-        #         - np.trace(self.A[t].T @ Gammainv @ self._xx_1T[t - 1])
-        #         + np.trace(self._xxT[t - 1] @ self.A[t].T @ Gammainv @ self.A[t])
-        #     )
-
-        # logp(yt|yt-1)
-        Q -= 0.5 * (
-            np.sum(self.Dy * np.log(2 * np.pi)) + np.log(self.sigma2) * np.sum(self.Dy)
-        )
-
+        # logp(yt|xt)
         for t in range(self.T):
-            # Sigmainv = 1 / self.sigma2 * np.eye(self.Dy[t])
+            sigmainv = self.weights[t].flatten().astype(float) / self.sigma2
             y = self.Y[t]
             C = self.C[t]
+            ytSigmainv = (y.flatten() * sigmainv).reshape(y.T.shape)
+            SigmainvC = sigmainv.reshape(-1, 1) * C
             Q -= 0.5 * (
-                # self.Dy[t] * np.log(2 * np.pi)
-                # + self._logdetdiag(self.sigma2 * np.ones(self.Dy[t]))
-                (
-                    y.T @ y
-                    - y.T @ C @ self._x[t]
-                    - self._x[t].T @ C.T @ y
-                    + np.trace(self._xxT[t] @ C.T @ C)
+                self.Dy[t] * np.log(2 * np.pi)
+                + self._logdetdiag(
+                    self.sigma2 * (1 / self.weights[t].flatten().astype(float))
+                )
+                + (
+                    ytSigmainv @ y
+                    - ytSigmainv @ C @ self._x[t]
+                    - self._x[t].T @ C.T @ ytSigmainv.T
+                    + np.trace(self._xxT[t] @ C.T @ SigmainvC)
                 ).astype(float)
-                / self.sigma2
                 # + y.T @ Sigmainv @ y
                 # - y.T @ Sigmainv @ C @ self._x[t]
                 # - self._x[t].T @ C.T @ Sigmainv @ y
@@ -389,6 +416,7 @@ class DynamicLinearRegression(DiagonalDLS):
         trend=False,
         seasonal=None,
         deterministic=False,
+        weights=None,
     ):
         """Dynamic Linear Regression Model
 
@@ -410,6 +438,10 @@ class DynamicLinearRegression(DiagonalDLS):
         deterministic : bool or array-like (Dx,), optional, by default, False
             indicate dth coefficient is deterministic system or not
             (if it has single element, all coefficients are indicated to be same)
+        weights: None or array-like (same shape with Y)
+            weights on observations. The observation covariance matrix is set to be sigma2 * diag(1/weights).
+            All elements must be positive
+            If None, all weights are set to be one
         """
 
         self.endogs = np.array(endogs, dtype=object)
@@ -513,6 +545,7 @@ class DynamicLinearRegression(DiagonalDLS):
             learn_gamma=learn_gamma,
             mu0=np.zeros(D_latent),
             P0=np.eye(D_latent) * 10,
+            weights=weights,
         )
 
     def fit(self, maxiter, loss_record=False, Q_record=True, miniter=10, tol=1e-3):
